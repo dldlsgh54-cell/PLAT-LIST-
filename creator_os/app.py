@@ -1,9 +1,10 @@
 import json
+import re
 import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -12,50 +13,82 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSlider,
     QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QListWidget,
 )
 
 
 APP_TITLE = "Creator OS"
 CONFIG_PATH = Path("Settings") / "config.json"
-GEMINI_TEST_PROMPT = "Reply only: OK"
+OPENAI_TEST_PROMPT = "Reply only: OK"
+DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+AUDIO_EXTENSIONS = {".mp3"}
+EXCEL_EXTENSIONS = {".xlsx", ".xlsm"}
 
 
 @dataclass
-class GeminiStatus:
+class OpenAIStatus:
     status: str = "Disconnected"
-    model: str = "gemini-3.5-flash"
+    model: str = DEFAULT_OPENAI_MODEL
     response_time_ms: int | None = None
     requests_today: int = 0
     last_error: str = ""
 
 
+@dataclass
+class ProjectState:
+    image_folder: Path | None = None
+    image_files: list[Path] = field(default_factory=list)
+    audio_folder: Path | None = None
+    audio_candidates: dict[str, list[Path]] = field(default_factory=dict)
+    selected_audio: dict[str, Path] = field(default_factory=dict)
+    lyrics_folder: Path | None = None
+    lyrics_by_track: dict[str, str] = field(default_factory=dict)
+    preview_duration: int = 0
+
+
 def load_config() -> dict:
-    if not CONFIG_PATH.exists():
-        return {
-            "gemini": {
-                "api_key": "",
-                "model": "gemini-3.5-flash",
-                "requests_today": 0,
-            }
+    default_config = {
+        "openai": {
+            "api_key": "",
+            "model": DEFAULT_OPENAI_MODEL,
+            "requests_today": 0,
         }
+    }
+    if not CONFIG_PATH.exists():
+        return default_config
     try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"gemini": {"api_key": "", "model": "gemini-3.5-flash", "requests_today": 0}}
+        return default_config
+
+    if "openai" not in config:
+        old_config = config.get("gemini", {})
+        config["openai"] = {
+            "api_key": "",
+            "model": old_config.get("model", DEFAULT_OPENAI_MODEL) or DEFAULT_OPENAI_MODEL,
+            "requests_today": int(old_config.get("requests_today", 0) or 0),
+        }
+    config["openai"].setdefault("api_key", "")
+    config["openai"].setdefault("model", DEFAULT_OPENAI_MODEL)
+    config["openai"].setdefault("requests_today", 0)
+    return config
 
 
 def save_config(config: dict) -> None:
@@ -63,56 +96,116 @@ def save_config(config: dict) -> None:
     CONFIG_PATH.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def run_gemini_connection_test(api_key: str, model: str) -> GeminiStatus:
+def run_openai_connection_test(api_key: str, model: str) -> OpenAIStatus:
     if not api_key.strip():
-        return GeminiStatus(status="Disconnected", model=model, last_error="API 키가 입력되지 않았습니다.")
+        return OpenAIStatus(status="Disconnected", model=model, last_error="API key를 입력해 주세요.")
 
-    payload = json.dumps({"model": model, "input": GEMINI_TEST_PROMPT}).encode("utf-8")
+    payload = json.dumps(
+        {
+            "model": model,
+            "input": OPENAI_TEST_PROMPT,
+            "max_output_tokens": 16,
+        }
+    ).encode("utf-8")
     request = urllib.request.Request(
-        "https://generativelanguage.googleapis.com/v1beta/interactions",
+        "https://api.openai.com/v1/responses",
         data=payload,
         headers={
+            "Authorization": f"Bearer {api_key.strip()}",
             "Content-Type": "application/json",
-            "x-goog-api-key": api_key.strip(),
         },
         method="POST",
     )
 
     started = time.perf_counter()
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urllib.request.urlopen(request, timeout=20) as response:
             raw = response.read().decode("utf-8", errors="replace")
         elapsed = int((time.perf_counter() - started) * 1000)
-        if "OK" in raw.upper():
-            return GeminiStatus(status="Connected", model=model, response_time_ms=elapsed)
-        return GeminiStatus(
-            status="Connected",
-            model=model,
-            response_time_ms=elapsed,
-            last_error="응답은 받았지만 OK 확인 문구가 명확하지 않습니다.",
-        )
+        data = json.loads(raw)
+        connected_model = data.get("model", model)
+        return OpenAIStatus(status="Connected", model=connected_model, response_time_ms=elapsed)
     except urllib.error.HTTPError as error:
         elapsed = int((time.perf_counter() - started) * 1000)
-        detail = error.read().decode("utf-8", errors="replace")[:500]
+        detail = error.read().decode("utf-8", errors="replace")[:800]
         if error.code == 429:
-            return GeminiStatus(
+            return OpenAIStatus(
                 status="Rate Limited",
                 model=model,
                 response_time_ms=elapsed,
-                last_error="요청 한도에 걸렸습니다.",
+                last_error="요청 한도 또는 결제 한도에 도달했습니다.",
             )
-        return GeminiStatus(
+        return OpenAIStatus(
             status="Disconnected",
             model=model,
             response_time_ms=elapsed,
             last_error=f"HTTP {error.code}: {detail}",
         )
-    except urllib.error.URLError as error:
-        return GeminiStatus(status="Offline", model=model, last_error=str(error.reason))
-    except TimeoutError:
-        return GeminiStatus(status="Offline", model=model, last_error="연결 시간이 초과되었습니다.")
-    except OSError as error:
-        return GeminiStatus(status="Disconnected", model=model, last_error=str(error))
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        return OpenAIStatus(status="Offline", model=model, last_error=str(error))
+    except json.JSONDecodeError as error:
+        return OpenAIStatus(status="Disconnected", model=model, last_error=f"응답 파싱 실패: {error}")
+
+
+def scan_images(folder: Path) -> list[Path]:
+    return sorted(path for path in folder.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS)
+
+
+def normalize_track(value) -> str:
+    text = str(value).strip().lower().replace(" ", "")
+    if not text:
+        return ""
+    digits = "".join(char for char in text if char.isdigit())
+    if digits:
+        return f"track{int(digits):02d}"
+    return text
+
+
+def track_from_filename(path: Path) -> str:
+    match = re.search(r"track[\s_-]*(\d{1,3})", path.stem, re.IGNORECASE)
+    if match:
+        return f"track{int(match.group(1)):02d}"
+    return normalize_track(path.stem)
+
+
+def scan_audio_candidates(folder: Path) -> dict[str, list[Path]]:
+    candidates: dict[str, list[Path]] = {}
+    for path in sorted(folder.rglob("*")):
+        if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS:
+            track = track_from_filename(path)
+            if track:
+                candidates.setdefault(track, []).append(path)
+    return dict(sorted(candidates.items()))
+
+
+def load_lyrics_from_excel_folder(folder: Path) -> dict[str, str]:
+    try:
+        from openpyxl import load_workbook
+    except ImportError as error:
+        raise RuntimeError("openpyxl이 설치되어 있지 않습니다. requirements.txt 설치가 필요합니다.") from error
+
+    lyrics: dict[str, str] = {}
+    files = sorted(path for path in folder.iterdir() if path.suffix.lower() in EXCEL_EXTENSIONS)
+    for file_path in files:
+        workbook = load_workbook(file_path, read_only=True, data_only=True)
+        sheet = workbook.active
+        for row in sheet.iter_rows(min_row=1, max_col=2, values_only=True):
+            track = normalize_track(row[0])
+            lyric = "" if row[1] is None else str(row[1]).strip()
+            if not track or not lyric or track in {"track", "no", "number"}:
+                continue
+            lyrics[track] = lyric
+        workbook.close()
+    return dict(sorted(lyrics.items()))
+
+
+def tone_colors(tone: str) -> tuple[str, str, str]:
+    return {
+        "good": ("#065f46", "#d1fae5", "#a7f3d0"),
+        "warn": ("#92400e", "#fef3c7", "#fde68a"),
+        "bad": ("#991b1b", "#fee2e2", "#fecaca"),
+        "neutral": ("#374151", "#f3f4f6", "#e5e7eb"),
+    }.get(tone, ("#374151", "#f3f4f6", "#e5e7eb"))
 
 
 class StatusPill(QLabel):
@@ -123,13 +216,7 @@ class StatusPill(QLabel):
         self.set_tone(tone)
 
     def set_tone(self, tone: str) -> None:
-        colors = {
-            "good": ("#065f46", "#d1fae5", "#a7f3d0"),
-            "warn": ("#92400e", "#fef3c7", "#fde68a"),
-            "bad": ("#991b1b", "#fee2e2", "#fecaca"),
-            "neutral": ("#374151", "#f3f4f6", "#e5e7eb"),
-        }
-        fg, bg, border = colors.get(tone, colors["neutral"])
+        fg, bg, border = tone_colors(tone)
         self.setStyleSheet(
             f"color: {fg}; background: {bg}; border: 1px solid {border}; "
             "border-radius: 8px; padding: 4px 10px; font-weight: 700;"
@@ -187,18 +274,7 @@ class Section(QFrame):
             self.layout.addWidget(body)
 
 
-def add_button_row(layout: QVBoxLayout, labels: list[str]) -> None:
-    row = QHBoxLayout()
-    row.setSpacing(8)
-    for label in labels:
-        button = QPushButton(label)
-        button.setMinimumHeight(36)
-        row.addWidget(button)
-    row.addStretch()
-    layout.addLayout(row)
-
-
-def gemini_tone(status: str) -> str:
+def openai_tone(status: str) -> str:
     return {
         "Connected": "good",
         "Rate Limited": "warn",
@@ -207,248 +283,52 @@ def gemini_tone(status: str) -> str:
     }.get(status, "neutral")
 
 
-def gemini_korean(status: str) -> str:
-    return {
-        "Connected": "연결됨",
-        "Rate Limited": "요청 제한",
-        "Disconnected": "연결 안 됨",
-        "Offline": "오프라인",
-    }.get(status, status)
+def button_style(tone: str) -> str:
+    if tone == "good":
+        return "background: #059669; color: white;"
+    if tone == "warn":
+        return "background: #d97706; color: white;"
+    if tone == "bad":
+        return "background: #dc2626; color: white;"
+    return ""
 
 
-class DashboardPage(QWidget):
-    def __init__(self, open_gemini_dialog) -> None:
-        super().__init__()
-        self.open_gemini_dialog = open_gemini_dialog
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(16)
-
-        header = QHBoxLayout()
-        title = QLabel("대시보드")
-        title.setObjectName("pageTitle")
-        self.gemini_pill = StatusPill("Gemini: 연결 안 됨", "bad")
-        gemini_button = QPushButton("Gemini 연결 확인")
-        gemini_button.clicked.connect(self.open_gemini_dialog)
-        header.addWidget(title)
-        header.addStretch()
-        header.addWidget(self.gemini_pill)
-        header.addWidget(gemini_button)
-        layout.addLayout(header)
-
-        metrics = QGridLayout()
-        metrics.setSpacing(12)
-        cards = [
-            MetricCard("오늘 작업", "0개", "승인 대기와 렌더 대기가 여기에 표시됩니다."),
-            MetricCard("휴식형 진행률", "0%", "Somnera / Noctis Atlas"),
-            MetricCard("보컬형 진행률", "0%", "Excel 가사 업로드부터 시작"),
-            MetricCard("숏츠 대기", "0개", "롱폼에서 파생될 후보"),
-            MetricCard("렌더 대기", "0개", "Preview Render 필요"),
-            MetricCard("60분 미달", "0개", "보컬형 렌더 차단 항목"),
-        ]
-        for index, card in enumerate(cards):
-            metrics.addWidget(card, index // 3, index % 3)
-        layout.addLayout(metrics)
-
-        today = Section("오늘 확인할 항목", "누락 파일, 오류 프로젝트, Gemini 오류, 사용자 승인 대기 항목을 우선 표시합니다.")
-        checklist = QListWidget()
-        checklist.setObjectName("checklist")
-        for item in [
-            "승인 대기 항목 없음",
-            "렌더 대기 항목 없음",
-            "누락 파일 없음",
-            "오류 프로젝트 없음",
-        ]:
-            QListWidgetItem(item, checklist)
-        today.layout.addWidget(checklist)
-        layout.addWidget(today, 1)
-
-    def update_gemini(self, status: GeminiStatus) -> None:
-        self.gemini_pill.setText(f"Gemini: {gemini_korean(status.status)}")
-        self.gemini_pill.set_tone(gemini_tone(status.status))
-
-
-class VocalStudioPage(QWidget):
-    def __init__(self) -> None:
-        super().__init__()
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(16)
-
-        title = QLabel("보컬형 제작")
-        title.setObjectName("pageTitle")
-        layout.addWidget(title)
-
-        row = QGridLayout()
-        row.setSpacing(12)
-        row.addWidget(MetricCard("목표 시간", "60:00", "60분 미만 렌더 차단", "warn"), 0, 0)
-        row.addWidget(MetricCard("선택된 플레이리스트", "00:00", "Winner 선택 전", "bad"), 0, 1)
-        row.addWidget(MetricCard("부족 시간", "60:00", "추가 Track 필요", "bad"), 0, 2)
-        row.addWidget(MetricCard("Gemini A/B 평가", "대기", "Track 단위로 2개씩 평가"), 1, 0)
-        row.addWidget(MetricCard("자막 상태", "미생성", "원본 가사 기반 SRT"), 1, 1)
-        row.addWidget(MetricCard("Preflight", "대기", "실패 시 렌더 차단"), 1, 2)
-        layout.addLayout(row)
-
-        workflow = Section("60분 플레이리스트 MVP 작업 흐름")
-        add_button_row(
-            workflow.layout,
-            ["프로젝트 생성", "Excel 가사 업로드", "A/B 음원 가져오기", "자동 매칭", "Preview Render"],
-        )
-
-        steps = QListWidget()
-        steps.setObjectName("checklist")
-        for item in [
-            "대기 - 프로젝트 생성",
-            "대기 - Excel 가사 업로드",
-            "대기 - A/B 음원 Drag & Drop Import",
-            "대기 - Track01 기준 자동 매칭",
-            "대기 - Python 길이 분석",
-            "대기 - Gemini A/B 평가",
-            "대기 - Winner 자동 선택",
-            "대기 - 총 길이 60분 검증",
-            "대기 - 10초 Preview Render",
-        ]:
-            QListWidgetItem(item, steps)
-        workflow.layout.addWidget(steps)
-        layout.addWidget(workflow, 1)
-
-
-class RestStudioPage(QWidget):
-    def __init__(self) -> None:
-        super().__init__()
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(16)
-        heading = QLabel("휴식형 제작")
-        heading.setObjectName("pageTitle")
-        layout.addWidget(heading)
-
-        grid = QGridLayout()
-        grid.setSpacing(12)
-        grid.addWidget(MetricCard("Somnera", "Room Profile", "한 영상 = 하나의 방"), 0, 0)
-        grid.addWidget(MetricCard("Noctis Atlas", "Journey Profile", "한 영상 = 하나의 여정"), 0, 1)
-        grid.addWidget(MetricCard("Master Playlist", "50~70분", "목표 시간까지 자연스럽게 Loop"), 0, 2)
-        layout.addLayout(grid)
-
-        section = Section("제작 흐름", "음악, Ambient Profile, 이미지, Flow Loop 영상을 등록하고 목표 길이만큼 반복 렌더합니다.")
-        add_button_row(section.layout, ["프로젝트 생성", "Profile 선택", "Ambient 적용", "Loop 계산", "Render Preview"])
-        layout.addWidget(section, 1)
-
-
-class ShortsStudioPage(QWidget):
-    def __init__(self) -> None:
-        super().__init__()
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(16)
-        heading = QLabel("숏츠 제작")
-        heading.setObjectName("pageTitle")
-        layout.addWidget(heading)
-
-        grid = QGridLayout()
-        grid.setSpacing(12)
-        grid.addWidget(MetricCard("포맷", "9:16", "세로 영상"), 0, 0)
-        grid.addWidget(MetricCard("후보 길이", "20 / 30 / 45 / 60초", "Hook Finder 기준"), 0, 1)
-        grid.addWidget(MetricCard("롱폼 연결", "필수", "Derived Content"), 0, 2)
-        layout.addLayout(grid)
-
-        section = Section("Hook Finder", "Python은 에너지 피크와 후렴 후보를 찾고, Gemini는 감정/가사/숏츠 적합성을 평가합니다.")
-        add_button_row(section.layout, ["Long Video 선택", "Hook 추출", "Gemini 평가", "세로 렌더", "업로드 준비"])
-        layout.addWidget(section, 1)
-
-
-class LibraryPage(QWidget):
-    def __init__(self) -> None:
-        super().__init__()
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(16)
-        heading = QLabel("라이브러리")
-        heading.setObjectName("pageTitle")
-        layout.addWidget(heading)
-
-        grid = QGridLayout()
-        grid.setSpacing(12)
-        for index, name in enumerate(["Audio", "Lyrics", "Images", "Videos", "Ambient", "Fonts", "Logos", "Prompts", "Templates"]):
-            grid.addWidget(MetricCard(name, "0개", "등록 대기"), index // 3, index % 3)
-        layout.addLayout(grid)
-        layout.addStretch()
-
-
-class AnalyticsPage(QWidget):
-    def __init__(self) -> None:
-        super().__init__()
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(16)
-        heading = QLabel("분석")
-        heading.setObjectName("pageTitle")
-        layout.addWidget(heading)
-
-        section = Section("Creator OS Memory", "조회수, CTR, 평균 시청 지속 시간, 좋아요, 댓글, Shorts 성과를 저장하고 다음 제작 방향을 추천합니다.")
-        add_button_row(section.layout, ["성과 가져오기", "성공 패턴 보기", "주간 리포트", "월간 리포트"])
-        layout.addWidget(section)
-        layout.addStretch()
-
-
-class SettingsPage(QWidget):
-    def __init__(self, open_gemini_dialog) -> None:
-        super().__init__()
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(16)
-        heading = QLabel("설정")
-        heading.setObjectName("pageTitle")
-        layout.addWidget(heading)
-
-        gemini = Section("Gemini API", "API 키와 모델을 입력하고 연결 상태를 확인합니다.")
-        gemini_button = QPushButton("Gemini API 입력 및 연결 확인")
-        gemini_button.setMinimumHeight(40)
-        gemini_button.clicked.connect(open_gemini_dialog)
-        gemini.layout.addWidget(gemini_button)
-        layout.addWidget(gemini)
-
-        paths = Section("작업 폴더", "Original / Working / Render / Export 구조로 원본을 보호합니다.")
-        add_button_row(paths.layout, ["CreatorOS 폴더 선택", "로그 폴더 열기", "FFmpeg 경로 설정"])
-        layout.addWidget(paths)
-        layout.addStretch()
-
-
-class GeminiDialog(QDialog):
-    def __init__(self, config: dict, current_status: GeminiStatus, parent=None) -> None:
+class OpenAIDialog(QDialog):
+    def __init__(self, config: dict, current_status: OpenAIStatus, parent=None) -> None:
         super().__init__(parent)
         self.config = config
         self.result_status = current_status
-        self.setWindowTitle("Gemini API 연결 확인")
+        self.setWindowTitle("ChatGPT API 연결 확인")
         self.setMinimumWidth(560)
 
-        gemini_config = self.config.setdefault("gemini", {})
+        openai_config = self.config.setdefault("openai", {})
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(12)
 
-        title = QLabel("Gemini API 설정")
+        title = QLabel("ChatGPT API 설정")
         title.setObjectName("dialogTitle")
         layout.addWidget(title)
 
-        info = QLabel("프로그램 실행 테스트 프롬프트: Reply only: OK")
+        info = QLabel("비용 절약 기본값은 gpt-5.4-mini입니다. 더 저렴한 단순 작업은 gpt-5.4-nano도 선택할 수 있습니다.")
         info.setObjectName("bodyText")
+        info.setWordWrap(True)
         layout.addWidget(info)
 
-        self.api_key = QLineEdit(gemini_config.get("api_key", ""))
-        self.api_key.setEchoMode(QLineEdit.Password)
-        self.api_key.setPlaceholderText("Gemini API Key 입력")
         layout.addWidget(QLabel("API Key"))
+        self.api_key = QLineEdit(openai_config.get("api_key", ""))
+        self.api_key.setEchoMode(QLineEdit.Password)
+        self.api_key.setPlaceholderText("OpenAI API Key 입력")
         layout.addWidget(self.api_key)
 
+        layout.addWidget(QLabel("Model"))
         self.model = QComboBox()
-        self.model.addItems(["gemini-3.5-flash", "gemini-3.1-flash", "gemini-3.1-pro", "gemini-2.5-flash"])
-        selected_model = gemini_config.get("model", current_status.model)
+        self.model.addItems(["gpt-5.4-mini", "gpt-5.4-nano", "gpt-5-mini", "gpt-4o-mini"])
+        selected_model = openai_config.get("model", current_status.model)
         index = self.model.findText(selected_model)
         if index >= 0:
             self.model.setCurrentIndex(index)
-        layout.addWidget(QLabel("Model"))
         layout.addWidget(self.model)
 
         self.status_label = QLabel()
@@ -457,7 +337,7 @@ class GeminiDialog(QDialog):
 
         self.error_box = QTextEdit()
         self.error_box.setReadOnly(True)
-        self.error_box.setFixedHeight(100)
+        self.error_box.setFixedHeight(110)
         layout.addWidget(self.error_box)
 
         buttons = QHBoxLayout()
@@ -476,56 +356,438 @@ class GeminiDialog(QDialog):
         self.update_status(current_status)
 
     def save_settings(self) -> None:
-        gemini = self.config.setdefault("gemini", {})
-        gemini["api_key"] = self.api_key.text().strip()
-        gemini["model"] = self.model.currentText()
-        gemini.setdefault("requests_today", 0)
+        openai_config = self.config.setdefault("openai", {})
+        openai_config["api_key"] = self.api_key.text().strip()
+        openai_config["model"] = self.model.currentText()
+        openai_config.setdefault("requests_today", 0)
         save_config(self.config)
-        QMessageBox.information(self, "저장 완료", "Gemini API 설정을 저장했습니다.")
+        QMessageBox.information(self, "저장 완료", "ChatGPT API 설정을 저장했습니다.")
 
     def test_connection(self) -> None:
-        self.save_settings()
+        openai_config = self.config.setdefault("openai", {})
+        openai_config["api_key"] = self.api_key.text().strip()
+        openai_config["model"] = self.model.currentText()
+        save_config(self.config)
+
         QApplication.setOverrideCursor(Qt.WaitCursor)
         QApplication.processEvents()
         try:
-            status = run_gemini_connection_test(self.api_key.text(), self.model.currentText())
+            status = run_openai_connection_test(self.api_key.text(), self.model.currentText())
         finally:
             QApplication.restoreOverrideCursor()
 
         if status.status in {"Connected", "Rate Limited"}:
-            gemini = self.config.setdefault("gemini", {})
-            gemini["requests_today"] = int(gemini.get("requests_today", 0)) + 1
-            status.requests_today = gemini["requests_today"]
+            openai_config["requests_today"] = int(openai_config.get("requests_today", 0)) + 1
+            status.requests_today = openai_config["requests_today"]
             save_config(self.config)
         else:
-            status.requests_today = int(self.config.setdefault("gemini", {}).get("requests_today", 0))
+            status.requests_today = int(openai_config.get("requests_today", 0))
 
         self.result_status = status
         self.update_status(status)
 
-    def update_status(self, status: GeminiStatus) -> None:
+    def update_status(self, status: OpenAIStatus) -> None:
         response_time = "-" if status.response_time_ms is None else f"{status.response_time_ms} ms"
         self.status_label.setText(
-            f"상태: {gemini_korean(status.status)}\n"
-            f"Model: {status.model}\n"
-            f"Response Time: {response_time}\n"
-            f"Requests Today: {status.requests_today}"
+            f"상태: {status.status}\n"
+            f"연결 모델: {status.model}\n"
+            f"응답 시간: {response_time}\n"
+            f"오늘 연결 확인: {status.requests_today}"
         )
         self.error_box.setPlainText(status.last_error or "Last Error: 없음")
+
+
+class DashboardPage(QWidget):
+    def __init__(self, open_api_dialog) -> None:
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(16)
+
+        header = QHBoxLayout()
+        title = QLabel("대시보드")
+        title.setObjectName("pageTitle")
+        self.openai_pill = StatusPill("ChatGPT: Disconnected", "bad")
+        api_button = QPushButton("ChatGPT API")
+        api_button.clicked.connect(open_api_dialog)
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(self.openai_pill)
+        header.addWidget(api_button)
+        layout.addLayout(header)
+
+        metrics = QGridLayout()
+        metrics.setSpacing(12)
+        cards = [
+            MetricCard("API 기본 모델", DEFAULT_OPENAI_MODEL, "비용 절약용 mini 기본값", "good"),
+            MetricCard("이미지 폴더", "미연결", "영상 이미지 소스"),
+            MetricCard("A/B MP3 폴더", "미연결", "TRACK01마다 후보 2개 중 1개 선택"),
+            MetricCard("엑셀 가사", "미연결", "왼쪽 track / 오른쪽 가사"),
+            MetricCard("Preview", "대기", "페이드 기준 타임라인 확인"),
+            MetricCard("Rendering", "대기", "지정 폴더 저장"),
+        ]
+        for index, card in enumerate(cards):
+            metrics.addWidget(card, index // 3, index % 3)
+        layout.addLayout(metrics)
+
+        note = Section(
+            "작업 순서",
+            "이미지 폴더 선택 -> A/B MP3 폴더 선택 -> 트랙별 음원 1개 선택 -> 엑셀 가사 폴더 선택 -> 실행 -> 점검 -> Preview -> Rendering 순서로 진행합니다.",
+        )
+        layout.addWidget(note, 1)
+
+    def update_openai(self, status: OpenAIStatus) -> None:
+        self.openai_pill.setText(f"ChatGPT: {status.status} / {status.model}")
+        self.openai_pill.set_tone(openai_tone(status.status))
+
+
+class VocalStudioPage(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.state = ProjectState()
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(14)
+
+        title = QLabel("영상 제작")
+        title.setObjectName("pageTitle")
+        layout.addWidget(title)
+
+        controls = Section("제작 입력")
+        control_row = QHBoxLayout()
+
+        self.image_button = QPushButton("이미지폴더")
+        self.image_button.clicked.connect(self.choose_image_folder)
+        self.audio_button = QPushButton("A/B MP3 폴더")
+        self.audio_button.clicked.connect(self.choose_audio_folder)
+        self.lyrics_button = QPushButton("엑셀 가사 폴더")
+        self.lyrics_button.clicked.connect(self.choose_lyrics_folder)
+        self.run_button = QPushButton("실행")
+        self.run_button.clicked.connect(self.run_matching)
+        self.check_button = QPushButton("점검")
+        self.check_button.clicked.connect(self.run_check)
+        self.preview_button = QPushButton("Preview")
+        self.preview_button.clicked.connect(self.build_preview)
+        self.render_button = QPushButton("Rendering")
+        self.render_button.clicked.connect(self.render_project)
+
+        for widget in [
+            self.image_button,
+            self.audio_button,
+            self.lyrics_button,
+            self.run_button,
+            self.check_button,
+            self.preview_button,
+            self.render_button,
+        ]:
+            control_row.addWidget(widget)
+        control_row.addStretch()
+        controls.layout.addLayout(control_row)
+        layout.addWidget(controls)
+
+        status_grid = QGridLayout()
+        status_grid.setSpacing(12)
+        self.image_status = StatusPill("이미지: 미연결", "bad")
+        self.audio_status = StatusPill("A/B 음원: 미연결", "bad")
+        self.lyrics_status = StatusPill("가사: 미연결", "bad")
+        self.sync_status = StatusPill("싱크: 미점검", "neutral")
+        status_grid.addWidget(self.image_status, 0, 0)
+        status_grid.addWidget(self.audio_status, 0, 1)
+        status_grid.addWidget(self.lyrics_status, 0, 2)
+        status_grid.addWidget(self.sync_status, 0, 3)
+        layout.addLayout(status_grid)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Track", "선택 MP3", "가사", "이미지"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.table, 1)
+
+        preview_section = Section("로그 / 미리보기")
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMinimumHeight(180)
+        preview_section.layout.addWidget(self.log)
+
+        slider_row = QHBoxLayout()
+        slider_row.addWidget(QLabel("Preview 시간"))
+        self.preview_slider = QSlider(Qt.Horizontal)
+        self.preview_slider.setRange(0, 0)
+        self.preview_slider.valueChanged.connect(self.update_preview_time)
+        self.preview_time_label = QLabel("00:00 / 00:00")
+        slider_row.addWidget(self.preview_slider, 1)
+        slider_row.addWidget(self.preview_time_label)
+        preview_section.layout.addLayout(slider_row)
+        layout.addWidget(preview_section)
+
+    def append_log(self, message: str) -> None:
+        self.log.append(message)
+
+    def choose_image_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "이미지 폴더 선택")
+        if not folder:
+            return
+        self.state.image_folder = Path(folder)
+        self.state.image_files = scan_images(self.state.image_folder)
+        if self.state.image_files:
+            self.image_status.setText(f"이미지: {len(self.state.image_files)}개 연결")
+            self.image_status.set_tone("good")
+            self.image_button.setStyleSheet(button_style("good"))
+            self.append_log(f"[이미지폴더] {self.state.image_folder}")
+            self.append_log("[이미지 효과] 첫 화면은 fade-in, 이미지 전환은 fade-out + fade-in으로 처리합니다.")
+        else:
+            self.image_status.setText("이미지: 파일 없음")
+            self.image_status.set_tone("warn")
+            self.image_button.setStyleSheet(button_style("warn"))
+            self.append_log("[이미지] 선택한 폴더에 이미지 파일이 없습니다.")
+        self.refresh_table()
+
+    def choose_audio_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "A/B MP3 폴더 선택")
+        if not folder:
+            return
+        self.state.audio_folder = Path(folder)
+        self.state.audio_candidates = scan_audio_candidates(self.state.audio_folder)
+        self.state.selected_audio.clear()
+
+        if self.state.audio_candidates:
+            total_files = sum(len(files) for files in self.state.audio_candidates.values())
+            self.audio_status.setText(f"A/B 음원: {len(self.state.audio_candidates)}트랙 / {total_files}개")
+            self.audio_status.set_tone("warn")
+            self.audio_button.setStyleSheet(button_style("warn"))
+            self.append_log(f"[A/B MP3 폴더] {self.state.audio_folder}")
+            self.append_log("[A/B 선택] 각 TRACK 행에서 후보 2개 중 사용할 MP3 1개를 선택해 주세요.")
+        else:
+            self.audio_status.setText("A/B 음원: MP3 없음")
+            self.audio_status.set_tone("bad")
+            self.audio_button.setStyleSheet(button_style("bad"))
+            self.append_log("[A/B MP3] 선택한 폴더에서 MP3 파일을 찾지 못했습니다.")
+        self.refresh_table()
+
+    def choose_lyrics_folder(self) -> None:
+        if not self.all_audio_selected():
+            QMessageBox.warning(self, "A/B 선택 필요", "가사를 넣기 전에 TRACK별 MP3 후보 중 1개씩 먼저 선택해 주세요.")
+            return
+        folder = QFileDialog.getExistingDirectory(self, "엑셀 가사 폴더 선택")
+        if not folder:
+            return
+        self.state.lyrics_folder = Path(folder)
+        try:
+            self.state.lyrics_by_track = load_lyrics_from_excel_folder(self.state.lyrics_folder)
+        except RuntimeError as error:
+            QMessageBox.critical(self, "가사 로드 실패", str(error))
+            return
+        if self.state.lyrics_by_track:
+            self.lyrics_status.setText(f"가사: {len(self.state.lyrics_by_track)}개 연결")
+            self.lyrics_status.set_tone("good")
+            self.lyrics_button.setStyleSheet(button_style("good"))
+            self.append_log(f"[엑셀 가사] {self.state.lyrics_folder}")
+            self.append_log("[형식] 왼쪽 칸 track / 오른쪽 칸 가사 인식 완료")
+        else:
+            self.lyrics_status.setText("가사: 인식 실패")
+            self.lyrics_status.set_tone("warn")
+            self.lyrics_button.setStyleSheet(button_style("warn"))
+            self.append_log("[엑셀 가사] track/가사 데이터를 찾지 못했습니다.")
+        self.refresh_table()
+
+    def refresh_table(self) -> None:
+        tracks = sorted(set(self.state.audio_candidates) | set(self.state.lyrics_by_track))
+        self.table.setRowCount(len(tracks))
+        for row, track in enumerate(tracks):
+            self.table.setItem(row, 0, QTableWidgetItem(track))
+
+            combo = QComboBox()
+            combo.addItem("선택")
+            for candidate in self.state.audio_candidates.get(track, []):
+                combo.addItem(candidate.name, str(candidate))
+            if track in self.state.selected_audio:
+                selected_path = str(self.state.selected_audio[track])
+                index = combo.findData(selected_path)
+                if index >= 0:
+                    combo.setCurrentIndex(index)
+            combo.currentIndexChanged.connect(lambda _index, track_name=track, widget=combo: self.set_track_audio(track_name, widget))
+            self.table.setCellWidget(row, 1, combo)
+
+            lyric = self.state.lyrics_by_track.get(track, "")
+            self.table.setItem(row, 2, QTableWidgetItem(lyric))
+
+            image = self.state.image_files[row % len(self.state.image_files)].name if self.state.image_files else ""
+            self.table.setItem(row, 3, QTableWidgetItem(image))
+
+    def set_track_audio(self, track: str, combo: QComboBox) -> None:
+        selected = combo.currentData()
+        if selected:
+            self.state.selected_audio[track] = Path(selected)
+        else:
+            self.state.selected_audio.pop(track, None)
+        self.update_audio_status()
+
+    def all_audio_selected(self) -> bool:
+        return bool(self.state.audio_candidates) and all(track in self.state.selected_audio for track in self.state.audio_candidates)
+
+    def update_audio_status(self) -> None:
+        total = len(self.state.audio_candidates)
+        selected = len(self.state.selected_audio)
+        if total and selected == total:
+            self.audio_status.setText(f"A/B 음원: {selected}/{total} 선택 완료")
+            self.audio_status.set_tone("good")
+            self.audio_button.setStyleSheet(button_style("good"))
+            self.append_log("[A/B 선택] 모든 트랙의 MP3 선택이 완료되었습니다.")
+        elif total:
+            self.audio_status.setText(f"A/B 음원: {selected}/{total} 선택")
+            self.audio_status.set_tone("warn")
+            self.audio_button.setStyleSheet(button_style("warn"))
+
+    def run_matching(self) -> None:
+        if not self.state.image_files or not self.state.lyrics_by_track or not self.all_audio_selected():
+            QMessageBox.warning(self, "실행 불가", "이미지 폴더, A/B MP3 선택, 엑셀 가사를 순서대로 완료해 주세요.")
+            return
+        self.append_log("[실행] 선택된 MP3 기준으로 track01부터 가사와 이미지를 매칭했습니다.")
+        self.append_log("[전환] 첫 화면 fade-in, 이미지 변경 fade-out + fade-in, 렌더링 계획에는 crossfade로 기록됩니다.")
+        self.sync_status.setText("싱크: 실행 완료")
+        self.sync_status.set_tone("good")
+
+    def run_check(self) -> None:
+        issues: list[str] = []
+        if not self.state.image_files:
+            issues.append("이미지 파일이 없습니다.")
+        if not self.state.audio_candidates:
+            issues.append("A/B MP3 파일이 없습니다.")
+        if self.state.audio_candidates:
+            short_tracks = [track for track, files in self.state.audio_candidates.items() if len(files) < 2]
+            if short_tracks:
+                issues.append(f"후보가 2개 미만인 트랙: {', '.join(short_tracks)}")
+        if not self.all_audio_selected():
+            issues.append("트랙별 MP3 선택이 완료되지 않았습니다.")
+        if not self.state.lyrics_by_track:
+            issues.append("가사 데이터가 없습니다.")
+        missing_lyrics = sorted(set(self.state.selected_audio) - set(self.state.lyrics_by_track))
+        if missing_lyrics:
+            issues.append(f"선택된 음원에 대응하는 가사가 없는 트랙: {', '.join(missing_lyrics)}")
+        if self.state.image_files and self.state.lyrics_by_track and len(self.state.image_files) < len(self.state.lyrics_by_track):
+            issues.append("이미지 수가 track 수보다 적습니다. 일부 이미지는 반복됩니다.")
+
+        if issues:
+            self.sync_status.setText("싱크: 확인 필요")
+            self.sync_status.set_tone("warn")
+            self.append_log("[점검] 확인 필요")
+            for issue in issues:
+                self.append_log(f" - {issue}")
+        else:
+            self.sync_status.setText("싱크: 정상")
+            self.sync_status.set_tone("good")
+            self.append_log("[점검] 가사, 이미지, 선택 MP3 상태가 정상입니다.")
+
+    def build_preview(self) -> None:
+        if not self.state.lyrics_by_track:
+            QMessageBox.warning(self, "Preview 불가", "엑셀 가사를 먼저 연결해 주세요.")
+            return
+        duration_per_track = 30
+        self.state.preview_duration = max(duration_per_track, len(self.state.lyrics_by_track) * duration_per_track)
+        self.preview_slider.setRange(0, self.state.preview_duration)
+        self.preview_slider.setValue(0)
+        self.log.clear()
+        self.append_log("[Preview] 첫 화면 1.5초 fade-in으로 시작합니다.")
+        self.append_log("[Preview] 이미지 전환은 1.0초 fade-out + fade-in으로 자연스럽게 넘어갑니다.")
+        for index, (track, lyric) in enumerate(self.state.lyrics_by_track.items()):
+            image = self.state.image_files[index % len(self.state.image_files)].name if self.state.image_files else "이미지 없음"
+            audio = self.state.selected_audio.get(track)
+            audio_name = audio.name if audio else "MP3 미선택"
+            start = index * duration_per_track
+            end = start + duration_per_track
+            effect = "fade-in" if index == 0 else "fade-out + fade-in"
+            self.append_log(f"{self.format_time(start)}-{self.format_time(end)} | {track} | {audio_name} | {image} | {effect}")
+            self.append_log(f"  {lyric[:120]}")
+        self.update_preview_time(0)
+
+    def render_project(self) -> None:
+        if not self.state.preview_duration:
+            QMessageBox.warning(self, "Rendering 불가", "Preview를 먼저 만들어 주세요.")
+            return
+        folder = QFileDialog.getExistingDirectory(self, "Rendering 저장 폴더 선택")
+        if not folder:
+            return
+        output_folder = Path(folder)
+        tracks = list(self.state.lyrics_by_track.items())
+        plan = {
+            "image_folder": str(self.state.image_folder) if self.state.image_folder else "",
+            "audio_folder": str(self.state.audio_folder) if self.state.audio_folder else "",
+            "lyrics_folder": str(self.state.lyrics_folder) if self.state.lyrics_folder else "",
+            "duration_seconds": self.state.preview_duration,
+            "opening_effect": {"type": "fade_in", "duration_seconds": 1.5},
+            "image_transition": {"type": "fade_out_fade_in", "duration_seconds": 1.0},
+            "tracks": [
+                {
+                    "track": track,
+                    "lyric": lyric,
+                    "audio": str(self.state.selected_audio.get(track, "")),
+                    "image": str(self.state.image_files[index % len(self.state.image_files)])
+                    if self.state.image_files
+                    else "",
+                    "start_seconds": index * 30,
+                    "duration_seconds": 30,
+                }
+                for index, (track, lyric) in enumerate(tracks)
+            ],
+        }
+        target = output_folder / "render_plan.json"
+        target.write_text(json.dumps(plan, indent=2, ensure_ascii=False), encoding="utf-8")
+        self.append_log(f"[Rendering] 저장 완료: {target}")
+        QMessageBox.information(self, "Rendering 완료", f"렌더링 계획을 저장했습니다.\n{target}")
+
+    def update_preview_time(self, value: int) -> None:
+        self.preview_time_label.setText(f"{self.format_time(value)} / {self.format_time(self.state.preview_duration)}")
+
+    @staticmethod
+    def format_time(seconds: int) -> str:
+        minutes, secs = divmod(max(0, seconds), 60)
+        return f"{minutes:02d}:{secs:02d}"
+
+
+class PlaceholderPage(QWidget):
+    def __init__(self, title: str, description: str) -> None:
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(16)
+        heading = QLabel(title)
+        heading.setObjectName("pageTitle")
+        layout.addWidget(heading)
+        section = Section(title, description)
+        layout.addWidget(section, 1)
+
+
+class SettingsPage(QWidget):
+    def __init__(self, open_api_dialog) -> None:
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(16)
+        heading = QLabel("설정")
+        heading.setObjectName("pageTitle")
+        layout.addWidget(heading)
+
+        openai = Section("ChatGPT API", "API key와 모델을 입력하고 연결된 모델명을 확인합니다.")
+        openai_button = QPushButton("ChatGPT API 입력 및 연결 확인")
+        openai_button.setMinimumHeight(40)
+        openai_button.clicked.connect(open_api_dialog)
+        openai.layout.addWidget(openai_button)
+        layout.addWidget(openai)
+        layout.addStretch()
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.config = load_config()
-        gemini_config = self.config.setdefault("gemini", {})
-        self.gemini_status = GeminiStatus(
-            model=gemini_config.get("model", "gemini-3.5-flash"),
-            requests_today=int(gemini_config.get("requests_today", 0)),
+        openai_config = self.config.setdefault("openai", {})
+        self.openai_status = OpenAIStatus(
+            model=openai_config.get("model", DEFAULT_OPENAI_MODEL),
+            requests_today=int(openai_config.get("requests_today", 0)),
         )
 
         self.setWindowTitle(APP_TITLE)
-        self.resize(1240, 800)
+        self.resize(1240, 820)
 
         root = QWidget()
         root_layout = QHBoxLayout(root)
@@ -541,7 +803,7 @@ class MainWindow(QMainWindow):
 
         brand = QLabel("Creator OS")
         brand.setObjectName("brand")
-        subtitle = QLabel("AI 음악 채널 운영체제")
+        subtitle = QLabel("AI 영상 제작 워크스페이스")
         subtitle.setObjectName("sidebarSub")
         sidebar_layout.addWidget(brand)
         sidebar_layout.addWidget(subtitle)
@@ -551,47 +813,46 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(self.nav, 1)
 
         self.stack = QStackedWidget()
-        self.dashboard_page = DashboardPage(self.open_gemini_dialog)
+        self.dashboard_page = DashboardPage(self.open_openai_dialog)
         pages = [
             ("대시보드", self.dashboard_page),
-            ("보컬형 제작", VocalStudioPage()),
-            ("휴식형 제작", RestStudioPage()),
-            ("숏츠 제작", ShortsStudioPage()),
-            ("라이브러리", LibraryPage()),
-            ("분석", AnalyticsPage()),
-            ("설정", SettingsPage(self.open_gemini_dialog)),
+            ("영상 제작", VocalStudioPage()),
+            ("휴식 음악", PlaceholderPage("휴식 음악", "Ambient / Journey 영상 제작 흐름은 다음 단계에서 연결합니다.")),
+            ("쇼츠 제작", PlaceholderPage("쇼츠 제작", "Hook Finder와 세로 영상 제작 흐름은 다음 단계에서 연결합니다.")),
+            ("라이브러리", PlaceholderPage("라이브러리", "이미지, 가사, 음원, 영상 자산을 모아 관리합니다.")),
+            ("분석", PlaceholderPage("분석", "성과 데이터와 제작 메모리를 기록합니다.")),
+            ("설정", SettingsPage(self.open_openai_dialog)),
         ]
         for name, page in pages:
             self.nav.addItem(name)
             self.stack.addWidget(page)
 
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
-        self.nav.setCurrentRow(0)
+        self.nav.setCurrentRow(1)
 
         root_layout.addWidget(sidebar)
         root_layout.addWidget(self.stack, 1)
         self.setCentralWidget(root)
 
-        gemini_action = QAction("Gemini 연결 확인", self)
-        gemini_action.triggered.connect(self.open_gemini_dialog)
+        api_action = QAction("ChatGPT API 연결 확인", self)
+        api_action.triggered.connect(self.open_openai_dialog)
         exit_action = QAction("종료", self)
         exit_action.triggered.connect(self.close)
         file_menu = self.menuBar().addMenu("파일")
-        file_menu.addAction(gemini_action)
+        file_menu.addAction(api_action)
         file_menu.addSeparator()
         file_menu.addAction(exit_action)
 
-        self.statusBar().showMessage("Creator OS 테스트 셸 준비 완료")
-        self.dashboard_page.update_gemini(self.gemini_status)
+        self.statusBar().showMessage("Creator OS 준비 완료")
+        self.dashboard_page.update_openai(self.openai_status)
         self.setStyleSheet(APP_STYLES)
 
-    def open_gemini_dialog(self) -> None:
-        dialog = GeminiDialog(self.config, self.gemini_status, self)
+    def open_openai_dialog(self) -> None:
+        dialog = OpenAIDialog(self.config, self.openai_status, self)
         dialog.exec()
-        self.gemini_status = dialog.result_status
-        self.dashboard_page.update_gemini(self.gemini_status)
-        status_text = gemini_korean(self.gemini_status.status)
-        self.statusBar().showMessage(f"Gemini 상태: {status_text}")
+        self.openai_status = dialog.result_status
+        self.dashboard_page.update_openai(self.openai_status)
+        self.statusBar().showMessage(f"ChatGPT 상태: {self.openai_status.status} / {self.openai_status.model}")
 
 
 APP_STYLES = """
@@ -675,22 +936,19 @@ QPushButton {
     font-weight: 700;
 }
 QPushButton:hover { background: #1d4ed8; }
-QLineEdit, QComboBox, QTextEdit {
+QLineEdit, QComboBox, QTextEdit, QTableWidget {
     background: white;
     border: 1px solid #d1d5db;
     border-radius: 6px;
     padding: 8px;
     color: #111827;
 }
-QListWidget#checklist {
-    background: white;
-    border: 1px solid #d1d5db;
-    border-radius: 8px;
-    padding: 8px;
+QHeaderView::section {
+    background: #eef2ff;
     color: #111827;
-}
-QListWidget#checklist::item {
-    min-height: 30px;
+    border: none;
+    padding: 8px;
+    font-weight: 700;
 }
 QMenuBar {
     background: #ffffff;
